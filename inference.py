@@ -4,14 +4,20 @@ import base64
 import logging
 from typing import List, Dict
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(name)
 
 def decode_image(image_base64: str) -> np.ndarray:
     """
     Decode base64 image to numpy array
     """
-    # Decode base64
-    image_bytes = base64.b64decode(image_base64)
+    # Decode base64 (strip whitespace and add padding)
+    image_base64 = image_base64.strip()
+    # Add padding if needed
+    missing_padding = len(image_base64) % 4
+    if missing_padding:
+        image_base64 += '=' * (4 - missing_padding)
+    
+    image_bytes = base64.b64decode(image_base64, validate=False)
     
     # Convert to numpy array
     np_array = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -27,11 +33,11 @@ def decode_image(image_base64: str) -> np.ndarray:
 def preprocess_image(image: np.ndarray, target_size=(640, 640)) -> np.ndarray:
     """
     Preprocess image for ONNX inference
-    - Resize to target size
-    - Normalize to [0, 1]
-    - Convert to float32
-    - Transpose to CHW format (channels first)
-    - Add batch dimension
+Resize to target size
+Normalize to [0, 1]
+Convert to float32
+Transpose to CHW format (channels first)
+Add batch dimension
     """
     # Resize
     resized = cv2.resize(image, target_size)
