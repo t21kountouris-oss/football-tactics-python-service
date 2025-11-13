@@ -24,8 +24,6 @@ model_loader = None
 
 # Initialize models at module level (Flask 3.0 compatible)
 with app.app_context():
-    global model_loader
-    
     logger.info("🚀 Initializing Python inference service...")
     
     # Download models from R2 (if configured)
