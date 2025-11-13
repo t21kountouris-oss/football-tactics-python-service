@@ -1,13 +1,29 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
+import onnxruntime as ort
 import base64
 import time
 import cv2
-from inference import run_field_detection
+import os
 
 app = Flask(__name__)
 CORS(app)
+
+# ============================================
+# LOAD MODEL ON STARTUP
+# ============================================
+print("🔄 Loading ONNX model...")
+MODEL_PATH = "field-detection.onnx"
+
+if not os.path.exists(MODEL_PATH):
+    print(f"❌ Model not found: {MODEL_PATH}")
+    session = None
+else:
+    session = ort.InferenceSession(MODEL_PATH)
+    print(f"✅ Model loaded: {MODEL_PATH}")
+    print(f"   - Inputs: {[inp.name for inp in session.get_inputs()]}")
+    print(f"   - Outputs: {[out.name for out in session.get_outputs()]}")
 
 # ============================================
 # HEALTH CHECK ENDPOINT
@@ -18,7 +34,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "message": "Football Tactics Python Service",
-        "models_loaded": ["field"]
+        "models_loaded": ["field"] if session else []
     })
 
 # ============================================
@@ -32,6 +48,12 @@ def detect_field():
     """
     try:
         start_time = time.time()
+        
+        if session is None:
+            return jsonify({
+                "success": False,
+                "error": "Model not loaded"
+            }), 500
         
         # Get base64 image from request
         data = request.get_json()
@@ -55,7 +77,8 @@ def detect_field():
                     "error": "Failed to decode image"
                 }), 400
             
-            print(f"✅ Image decoded: {image.shape}")
+            h, w = image.shape[:2]
+            print(f"✅ Image decoded: {w}x{h}")
                 
         except Exception as e:
             print(f"❌ Image decoding error: {e}")
@@ -64,20 +87,22 @@ def detect_field():
                 "error": f"Image decoding error: {str(e)}"
             }), 400
         
+        # Preprocess image for ONNX
+        print("🔍 Preprocessing image...")
+        input_tensor = preprocess_image(image, target_size=(640, 640))
+        
         # Run ONNX inference
         print("🔍 Running ONNX inference...")
-        predictions = run_field_detection(image)
-        print(f"✅ ONNX inference complete")
-        print(f"   - Type: {type(predictions)}")
-        print(f"   - Length: {len(predictions) if isinstance(predictions, list) else 'N/A'}")
+        input_name = session.get_inputs()[0].name
+        outputs = session.run(None, {input_name: input_tensor})
         
-        if isinstance(predictions, list) and len(predictions) > 0:
-            print(f"   - First element type: {type(predictions[0])}")
-            print(f"   - First element shape: {predictions[0].shape if hasattr(predictions[0], 'shape') else 'N/A'}")
+        print(f"✅ ONNX inference complete")
+        print(f"   - Outputs: {len(outputs)}")
+        print(f"   - Output shape: {outputs[0].shape}")
         
         # Parse predictions into 32 keypoints
         print("🔍 Parsing keypoints...")
-        keypoints = parse_keypoint_predictions(predictions)
+        keypoints = parse_keypoint_predictions(outputs, w, h)
         print(f"✅ Parsed {len(keypoints)} keypoints")
         
         inference_time = (time.time() - start_time) * 1000  # Convert to ms
@@ -101,13 +126,39 @@ def detect_field():
         }), 500
 
 # ============================================
+# HELPER: PREPROCESS IMAGE
+# ============================================
+def preprocess_image(image, target_size=(640, 640)):
+    """
+    Preprocess image for ONNX inference
+    - Resize to target size
+    - Normalize to [0, 1]
+    - Convert to float32
+    - Transpose to CHW format (channels first)
+    - Add batch dimension
+    """
+    # Resize
+    resized = cv2.resize(image, target_size)
+    
+    # Normalize to [0, 1]
+    normalized = resized.astype(np.float32) / 255.0
+    
+    # Transpose to CHW (channels first)
+    transposed = np.transpose(normalized, (2, 0, 1))
+    
+    # Add batch dimension
+    batched = np.expand_dims(transposed, axis=0)
+    
+    return batched
+
+# ============================================
 # HELPER: PARSE KEYPOINT PREDICTIONS
 # ============================================
-def parse_keypoint_predictions(predictions):
+def parse_keypoint_predictions(outputs, original_width, original_height):
     """
     Parse raw ONNX predictions into 32 keypoints
     
-    Roboflow YOLOv8 keypoint model output:
+    YOLOv8 keypoint model output:
     - Shape: (1, 391, 8400) 
     - Format: [batch, features, detections]
     - Features (391): 
@@ -119,37 +170,38 @@ def parse_keypoint_predictions(predictions):
     keypoints = []
     
     try:
-        if not isinstance(predictions, list) or len(predictions) == 0:
-            print("❌ Invalid predictions format")
-            return []
-        
         # Get the output tensor (should be shape: (1, 391, 8400))
-        output = predictions[0]
+        output = outputs[0]
         print(f"📊 Output shape: {output.shape}")
         
         # Transpose to (8400, 391) for easier processing
-        output = output.T  # Now shape: (detections, features)
+        output = output.transpose(0, 2, 1)  # (1, 8400, 391)
+        output = output[0]  # Remove batch dimension -> (8400, 391)
         print(f"📊 Transposed shape: {output.shape}")
         
         # Extract keypoints from each detection
         # Keypoint data starts at index 101 (after bbox + objectness + class scores)
-        # Format: [kp1_x, kp1_y, kp1_conf, kp2_x, kp2_y, kp2_conf, ..., kp32_x, kp32_y, kp32_conf]
-        
         KEYPOINT_START = 101
         NUM_KEYPOINTS = 32
         
-        # Process each detection (row)
-        for detection_idx in range(output.shape[0]):
-            detection = output[detection_idx]
-            
-            # Get objectness score (index 4)
-            objectness = float(detection[4])
-            
-            # Only process detections with high confidence
-            if objectness < 0.3:
-                continue
-            
-            print(f"   Detection {detection_idx}: objectness={objectness:.3f}")
+        # Scale factors (from 640x640 to original image size)
+        scale_x = original_width / 640.0
+        scale_y = original_height / 640.0
+        
+        # Find detection with highest objectness
+        best_detection_idx = -1
+        best_objectness = 0.0
+        
+        for i in range(output.shape[0]):
+            obj = float(output[i, 4])
+            if obj > best_objectness:
+                best_objectness = obj
+                best_detection_idx = i
+        
+        print(f"   Best detection: idx={best_detection_idx}, objectness={best_objectness:.3f}")
+        
+        if best_detection_idx >= 0 and best_objectness > 0.3:
+            detection = output[best_detection_idx]
             
             # Extract 32 keypoints
             for kp_idx in range(NUM_KEYPOINTS):
@@ -159,22 +211,17 @@ def parse_keypoint_predictions(predictions):
                 if base_idx + 2 >= len(detection):
                     break
                 
-                kp_x = float(detection[base_idx])
-                kp_y = float(detection[base_idx + 1])
+                kp_x = float(detection[base_idx]) * scale_x
+                kp_y = float(detection[base_idx + 1]) * scale_y
                 kp_conf = float(detection[base_idx + 2])
                 
-                # Only add visible keypoints
-                if kp_conf > 0.5:
-                    keypoints.append({
-                        "x": round(kp_x, 2),
-                        "y": round(kp_y, 2),
-                        "confidence": round(kp_conf, 3),
-                        "class_name": get_keypoint_name(kp_idx)
-                    })
-            
-            # If we found keypoints from this detection, stop (only process best detection)
-            if len(keypoints) > 0:
-                break
+                # Add all keypoints (even low confidence ones)
+                keypoints.append({
+                    "x": round(kp_x, 2),
+                    "y": round(kp_y, 2),
+                    "confidence": round(kp_conf, 3),
+                    "class_name": get_keypoint_name(kp_idx)
+                })
         
         print(f"✅ Extracted {len(keypoints)} keypoints")
         return keypoints
@@ -190,7 +237,6 @@ def parse_keypoint_predictions(predictions):
 # ============================================
 def get_keypoint_name(index):
     """Get human-readable name for keypoint index (0-31)"""
-    # Standard football field keypoint names (32 total)
     names = [
         "top_left_corner", "top_right_corner", "bottom_left_corner", "bottom_right_corner",
         "left_penalty_top_left", "left_penalty_top_right", "left_penalty_bottom_left", "left_penalty_bottom_right",
