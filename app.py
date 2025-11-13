@@ -54,18 +54,31 @@ def detect_field():
                     "success": False,
                     "error": "Failed to decode image"
                 }), 400
+            
+            print(f"✅ Image decoded: {image.shape}")
                 
         except Exception as e:
+            print(f"❌ Image decoding error: {e}")
             return jsonify({
                 "success": False,
                 "error": f"Image decoding error: {str(e)}"
             }), 400
         
         # Run ONNX inference
+        print("🔍 Running ONNX inference...")
         predictions = run_field_detection(image)
+        print(f"✅ ONNX inference complete")
+        print(f"   - Type: {type(predictions)}")
+        print(f"   - Length: {len(predictions) if isinstance(predictions, list) else 'N/A'}")
+        
+        if isinstance(predictions, list) and len(predictions) > 0:
+            print(f"   - First element type: {type(predictions[0])}")
+            print(f"   - First element shape: {predictions[0].shape if hasattr(predictions[0], 'shape') else 'N/A'}")
         
         # Parse predictions into 32 keypoints
+        print("🔍 Parsing keypoints...")
         keypoints = parse_keypoint_predictions(predictions)
+        print(f"✅ Parsed {len(keypoints)} keypoints")
         
         inference_time = (time.time() - start_time) * 1000  # Convert to ms
         
@@ -77,9 +90,14 @@ def detect_field():
         })
         
     except Exception as e:
+        print(f"❌❌❌ CRITICAL ERROR in detect_field: {e}")
+        import traceback
+        traceback.print_exc()
+        
         return jsonify({
             "success": False,
-            "error": f"Server error: {str(e)}"
+            "error": f"Server error: {str(e)}",
+            "type": type(e).__name__
         }), 500
 
 # ============================================
@@ -89,72 +107,106 @@ def parse_keypoint_predictions(predictions):
     """
     Parse raw ONNX predictions into 32 keypoints
     
-    Roboflow keypoint model output format:
-    - predictions: array of shape (1, 391, 8400) or similar
-    - Each detection has: [x, y, w, h, confidence, class_id, kp1_x, kp1_y, kp1_conf, ...]
-    
-    Returns: List of 32 keypoints with {x, y, confidence, class_name}
+    Roboflow YOLOv8 keypoint model output:
+    - Shape: (1, 391, 8400) 
+    - Format: [batch, features, detections]
+    - Features (391): 
+        [0-3]: bbox (x, y, w, h)
+        [4]: objectness score
+        [5-100]: class probabilities (96 classes)
+        [101-390]: keypoint data (32 keypoints × 3 values each: x, y, confidence)
     """
     keypoints = []
     
     try:
-        # predictions is a list with one array
-        # Shape: (1, features, num_predictions)
-        pred_array = predictions[0]  # Get first (and only) array
+        if not isinstance(predictions, list) or len(predictions) == 0:
+            print("❌ Invalid predictions format")
+            return []
         
-        # Transpose to (num_predictions, features)
-        if len(pred_array.shape) == 2:
-            pred_array = pred_array.T
+        # Get the output tensor (should be shape: (1, 391, 8400))
+        output = predictions[0]
+        print(f"📊 Output shape: {output.shape}")
         
-        # Extract keypoint data
-        # Assuming format: [x, y, w, h, obj_conf, class_conf, ...keypoint_data...]
-        # Keypoints typically start after the first 6 values
+        # Transpose to (8400, 391) for easier processing
+        output = output.T  # Now shape: (detections, features)
+        print(f"📊 Transposed shape: {output.shape}")
         
-        # For each prediction row
-        for i in range(min(pred_array.shape[0], 100)):  # Check first 100 predictions
-            row = pred_array[i]
+        # Extract keypoints from each detection
+        # Keypoint data starts at index 101 (after bbox + objectness + class scores)
+        # Format: [kp1_x, kp1_y, kp1_conf, kp2_x, kp2_y, kp2_conf, ..., kp32_x, kp32_y, kp32_conf]
+        
+        KEYPOINT_START = 101
+        NUM_KEYPOINTS = 32
+        
+        # Process each detection (row)
+        for detection_idx in range(output.shape[0]):
+            detection = output[detection_idx]
             
-            # Object confidence (usually at index 4)
-            obj_conf = float(row[4]) if len(row) > 4 else 0.0
+            # Get objectness score (index 4)
+            objectness = float(detection[4])
             
-            # Only process predictions with confidence > 0.25
-            if obj_conf < 0.25:
+            # Only process detections with high confidence
+            if objectness < 0.3:
                 continue
             
-            # Keypoints usually start at index 6 (after bbox + confidences)
-            # Format: [kp1_x, kp1_y, kp1_conf, kp2_x, kp2_y, kp2_conf, ...]
-            keypoint_start_idx = 6
-            num_keypoints_per_detection = (len(row) - keypoint_start_idx) // 3
+            print(f"   Detection {detection_idx}: objectness={objectness:.3f}")
             
-            for kp_idx in range(num_keypoints_per_detection):
-                base_idx = keypoint_start_idx + (kp_idx * 3)
+            # Extract 32 keypoints
+            for kp_idx in range(NUM_KEYPOINTS):
+                base_idx = KEYPOINT_START + (kp_idx * 3)
                 
-                if base_idx + 2 >= len(row):
+                # Check bounds
+                if base_idx + 2 >= len(detection):
                     break
                 
-                kp_x = float(row[base_idx])
-                kp_y = float(row[base_idx + 1])
-                kp_conf = float(row[base_idx + 2])
+                kp_x = float(detection[base_idx])
+                kp_y = float(detection[base_idx + 1])
+                kp_conf = float(detection[base_idx + 2])
                 
-                # Only add keypoints with confidence > 0.3
-                if kp_conf > 0.3:
+                # Only add visible keypoints
+                if kp_conf > 0.5:
                     keypoints.append({
                         "x": round(kp_x, 2),
                         "y": round(kp_y, 2),
                         "confidence": round(kp_conf, 3),
-                        "class_name": f"keypoint_{kp_idx}"
+                        "class_name": get_keypoint_name(kp_idx)
                     })
+            
+            # If we found keypoints from this detection, stop (only process best detection)
+            if len(keypoints) > 0:
+                break
         
-        # Sort by confidence and take top 32
-        keypoints.sort(key=lambda k: k['confidence'], reverse=True)
-        keypoints = keypoints[:32]
-        
+        print(f"✅ Extracted {len(keypoints)} keypoints")
         return keypoints
         
     except Exception as e:
         print(f"❌ Error parsing predictions: {e}")
-        # Return empty list if parsing fails
+        import traceback
+        traceback.print_exc()
         return []
+
+# ============================================
+# HELPER: KEYPOINT NAMES
+# ============================================
+def get_keypoint_name(index):
+    """Get human-readable name for keypoint index (0-31)"""
+    # Standard football field keypoint names (32 total)
+    names = [
+        "top_left_corner", "top_right_corner", "bottom_left_corner", "bottom_right_corner",
+        "left_penalty_top_left", "left_penalty_top_right", "left_penalty_bottom_left", "left_penalty_bottom_right",
+        "right_penalty_top_left", "right_penalty_top_right", "right_penalty_bottom_left", "right_penalty_bottom_right",
+        "left_six_yard_top_left", "left_six_yard_top_right", "left_six_yard_bottom_left", "left_six_yard_bottom_right",
+        "right_six_yard_top_left", "right_six_yard_top_right", "right_six_yard_bottom_left", "right_six_yard_bottom_right",
+        "center_circle_top", "center_circle_bottom", "center_circle_left", "center_circle_right",
+        "halfway_line_top", "halfway_line_bottom",
+        "left_goal_left_post", "left_goal_right_post", "right_goal_left_post", "right_goal_right_post",
+        "penalty_spot_left", "penalty_spot_right"
+    ]
+    
+    if index < len(names):
+        return names[index]
+    else:
+        return f"keypoint_{index}"
 
 # ============================================
 # START SERVER
