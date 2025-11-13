@@ -22,32 +22,30 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Global model loader (singleton)
 model_loader = None
 
-@app.before_first_request
-def initialize():
-    """Initialize models on first request"""
-    global model_loader
+with app.app_context():       
+        global model_loader
     
     logger.info("🚀 Initializing Python inference service...")
     
-    # Download models from R2 (if configured)
-    try:
-        logger.info("📥 Attempting to download models from R2...")
-        success = download_models_from_r2()
-        
-        if success:
-            logger.info("✅ Models downloaded from R2")
-        else:
-            logger.warning("⚠️ R2 download failed, will use local models if available")
-    except Exception as e:
-        logger.warning(f"⚠️ R2 download error: {e}")
-    
-    # Initialize model loader
-    try:
-        model_loader = ModelLoader()
-        logger.info("✅ Model loader initialized")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize model loader: {e}")
-        raise
+                        # Download models from R2 (if configured)
+                        try:
+                            logger.info("📥 Attempting to download models from R2...")
+                            success = download_models_from_r2()
+                            
+                            if success:
+                                logger.info("✅ Models downloaded from R2")
+                            else:
+                                logger.warning("⚠️ R2 download failed, will use local models if available")
+                        except Exception as e:
+                            logger.warning(f"⚠️ R2 download error: {e}")
+                        
+                        # Initialize model loader
+                        try:
+                            model_loader = ModelLoader()
+                            logger.info("✅ Model loader initialized")
+                        except Exception as e:
+                            logger.error(f"❌ Failed to initialize model loader: {e}")
+                            raise
 
 @app.route('/health', methods=['GET'])
 def health_check():
