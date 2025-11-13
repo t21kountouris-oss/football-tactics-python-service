@@ -1,0 +1,39 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\froman\fcharset0 Times-Roman;\f1\froman\fcharset0 Times-Bold;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;}
+{\*\expandedcolortbl;;\cssrgb\c0\c0\c0;}
+{\*\listtable{\list\listtemplateid1\listhybrid{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{disc\}}{\leveltext\leveltemplateid1\'01\uc0\u8226 ;}{\levelnumbers;}\fi-360\li720\lin720 }{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelspace360\levelindent0{\*\levelmarker \{circle\}}{\leveltext\leveltemplateid2\'01\uc0\u9702 ;}{\levelnumbers;}\fi-360\li1440\lin1440 }{\listname ;}\listid1}}
+{\*\listoverridetable{\listoverride\listid1\listoverridecount0\ls1}}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\deftab720
+\pard\pardeftab720\sa240\partightenfactor0
+
+\f0\fs24 \cf0 \expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 import numpy as np\uc0\u8232 import cv2\u8232 import base64\u8232 import logging\u8232 from typing import List, Dict\
+\
+logger = logging.getLogger(
+\f1\b name
+\f0\b0 )\
+\
+def decode_image(image_base64: str) -> np.ndarray:\uc0\u8232     """\u8232     Decode base64 image to numpy array\u8232     """\u8232     # Decode base64\u8232     image_bytes = base64.b64decode(image_base64)\u8232     \u8232     # Convert to numpy array\u8232     np_array = np.frombuffer(image_bytes, dtype=np.uint8)\u8232     \u8232     # Decode image\u8232     image = cv2.imdecode(np_array, cv2.IMREAD_COLOR)\u8232     \u8232     if image is None:\u8232         raise ValueError("Failed to decode image")\u8232     \u8232     return image\
+\
+def preprocess_image(image: np.ndarray, target_size=(640, 640)) -> np.ndarray:\uc0\u8232     """\u8232     Preprocess image for ONNX inference\
+\pard\tx940\tx1440\pardeftab720\li1440\fi-1440\partightenfactor0
+\ls1\ilvl1\cf0 \kerning1\expnd0\expndtw0 \outl0\strokewidth0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Resize to target size\
+\ls1\ilvl1\kerning1\expnd0\expndtw0 \outl0\strokewidth0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Normalize to [0, 1]\
+\ls1\ilvl1\kerning1\expnd0\expndtw0 \outl0\strokewidth0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Convert to float32\
+\ls1\ilvl1\kerning1\expnd0\expndtw0 \outl0\strokewidth0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Transpose to CHW format (channels first)\
+\ls1\ilvl1\kerning1\expnd0\expndtw0 \outl0\strokewidth0 {\listtext	\uc0\u9702 	}\expnd0\expndtw0\kerning0
+\outl0\strokewidth0 \strokec2 Add batch dimension\uc0\u8232     """\u8232     # Resize\u8232     resized = cv2.resize(image, target_size)\u8232     \u8232     # Normalize to [0, 1]\u8232     normalized = resized.astype(np.float32) / 255.0\u8232     \u8232     # Transpose to CHW (channels first)\u8232     transposed = np.transpose(normalized, (2, 0, 1))\u8232     \u8232     # Add batch dimension\u8232     batched = np.expand_dims(transposed, axis=0)\u8232     \u8232     return batched\
+\pard\pardeftab720\sa240\partightenfactor0
+\cf0 \
+def run_field_detection(model_loader, image_base64: str) -> List[Dict]:\uc0\u8232     """\u8232     Run field detection (32 keypoints)\u8232     Returns list of predictions in Roboflow format\u8232     """\u8232     # Get model\u8232     model = model_loader.get_model('field')\u8232     \u8232     if model is None:\u8232         raise ValueError("Field model not loaded")\u8232     \u8232     # Decode image\u8232     image = decode_image(image_base64)\u8232     h, w = image.shape[:2]\u8232     \u8232     logger.info(f"   - Image dimensions: \{w\}x\{h\}")\u8232     \u8232     # Preprocess\u8232     input_tensor = preprocess_image(image)\u8232     \u8232     # Run inference\u8232     input_name = model.get_inputs()[0].name\u8232     outputs = model.run(None, \{input_name: input_tensor\})\u8232     \u8232     # Post-process (example - adapt to your model's output format)\u8232     keypoints = outputs[0]  # Assuming first output is keypoints\u8232     \u8232     # Convert to Roboflow format\u8232     predictions = []\u8232     for i, kp in enumerate(keypoints[0]):  # Remove batch dimension\u8232         predictions.append(\{\u8232             "x": float(kp[0] * w),  # Scale to original image size\u8232             "y": float(kp[1] * h),\u8232             "class": f"keypoint_\{i\}",\u8232             "confidence": float(kp[2]) if len(kp) > 2 else 0.95\u8232         \})\u8232     \u8232     return predictions\
+\
+def run_player_detection(model_loader, image_base64: str) -> List[Dict]:\uc0\u8232     """\u8232     Run player detection (bounding boxes)\u8232     Returns list of predictions in Roboflow format\u8232     """\u8232     # Get model\u8232     model = model_loader.get_model('players')\u8232     \u8232     if model is None:\u8232         raise ValueError("Players model not loaded")\u8232     \u8232     # Decode image\u8232     image = decode_image(image_base64)\u8232     h, w = image.shape[:2]\u8232     \u8232     logger.info(f"   - Image dimensions: \{w\}x\{h\}")\u8232     \u8232     # Preprocess\u8232     input_tensor = preprocess_image(image)\u8232     \u8232     # Run inference\u8232     input_name = model.get_inputs()[0].name\u8232     outputs = model.run(None, \{input_name: input_tensor\})\u8232     \u8232     # Parse YOLO output (adapt to your model's format)\u8232     detections_raw = outputs[0]\u8232     \u8232     # Convert to Roboflow format\u8232     predictions = []\u8232     for det in detections_raw[0]:  # Remove batch dimension\u8232         if det[4] > 0.5:  # Confidence threshold\u8232             predictions.append(\{\u8232                 "x": float(det[0] * w),\u8232                 "y": float(det[1] * h),\u8232                 "width": float(det[2] * w),\u8232                 "height": float(det[3] * h),\u8232                 "class": "player",\u8232                 "confidence": float(det[4])\u8232             \})\u8232     \u8232     return predictions\
+\
+def run_ball_detection(model_loader, image_base64: str) -> List[Dict]:\uc0\u8232     """\u8232     Run ball detection (bounding boxes)\u8232     Returns list of predictions in Roboflow format\u8232     """\u8232     # Get model\u8232     model = model_loader.get_model('ball')\u8232     \u8232     if model is None:\u8232         raise ValueError("Ball model not loaded")\u8232     \u8232     # Decode image\u8232     image = decode_image(image_base64)\u8232     h, w = image.shape[:2]\u8232     \u8232     logger.info(f"   - Image dimensions: \{w\}x\{h\}")\u8232     \u8232     # Preprocess\u8232     input_tensor = preprocess_image(image)\u8232     \u8232     # Run inference\u8232     input_name = model.get_inputs()[0].name\u8232     outputs = model.run(None, \{input_name: input_tensor\})\u8232     \u8232     # Parse YOLO output (adapt to your model's format)\u8232     detections_raw = outputs[0]\u8232     \u8232     # Convert to Roboflow format\u8232     predictions = []\u8232     for det in detections_raw[0]:  # Remove batch dimension\u8232         if det[4] > 0.5:  # Confidence threshold\u8232             predictions.append(\{\u8232                 "x": float(det[0] * w),\u8232                 "y": float(det[1] * h),\u8232                 "width": float(det[2] * w),\u8232                 "height": float(det[3] * h),\u8232                 "class": "ball",\u8232                 "confidence": float(det[4])\u8232             \})\u8232     \u8232     return predictions\
+}
