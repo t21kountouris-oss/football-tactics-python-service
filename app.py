@@ -25,6 +25,53 @@ CORS(app)
 field_model = None
 field_session = None
 
+def list_r2_files():
+    """List all files in R2 bucket for debugging"""
+    try:
+        logger.info("🔍 Listing R2 bucket contents...")
+        
+        # R2 credentials from environment
+        r2_access_key = os.environ.get('R2_ACCESS_KEY_ID')
+        r2_secret_key = os.environ.get('R2_SECRET_ACCESS_KEY')
+        r2_endpoint = os.environ.get('R2_ENDPOINT_URL')
+        r2_bucket = 'football-tactics-models'
+        
+        if not all([r2_access_key, r2_secret_key, r2_endpoint]):
+            logger.error("❌ R2 credentials not configured")
+            return []
+        
+        # Create S3 client for R2
+        s3 = boto3.client(
+            's3',
+            endpoint_url=r2_endpoint,
+            aws_access_key_id=r2_access_key,
+            aws_secret_access_key=r2_secret_key,
+            config=Config(signature_version='s3v4'),
+            region_name='auto'
+        )
+        
+        # List objects
+        response = s3.list_objects_v2(Bucket=r2_bucket)
+        
+        if 'Contents' not in response:
+            logger.warning("⚠️ R2 bucket is empty")
+            return []
+        
+        files = []
+        for obj in response['Contents']:
+            file_info = {
+                'key': obj['Key'],
+                'size': obj['Size'] / (1024 * 1024),  # MB
+                'last_modified': str(obj['LastModified'])
+            }
+            files.append(file_info)
+            logger.info(f"   - Found: {obj['Key']} ({file_info['size']:.2f} MB)")
+        
+        return files
+    except Exception as e:
+        logger.error(f"❌ Failed to list R2 contents: {e}")
+        return []
+
 def download_model_from_r2():
     """Download ONNX model from Cloudflare R2"""
     try:
@@ -50,11 +97,43 @@ def download_model_from_r2():
             region_name='auto'
         )
         
+        # List files first to find the model
+        files = list_r2_files()
+        
+        # Try different possible paths
+        possible_paths = [
+            'field-detection.onnx',
+            'models/field/field-detection.onnx',
+            'field/field-detection.onnx',
+            'onnx/field-detection.onnx'
+        ]
+        
+        model_key = None
+        for path in possible_paths:
+            if any(f['key'] == path for f in files):
+                model_key = path
+                logger.info(f"✅ Found model at: {model_key}")
+                break
+        
+        if not model_key:
+            # If no exact match, try to find any .onnx file with 'field' in the name
+            for f in files:
+                if 'field' in f['key'].lower() and f['key'].endswith('.onnx'):
+                    model_key = f['key']
+                    logger.info(f"✅ Found field model at: {model_key}")
+                    break
+        
+        if not model_key:
+            logger.error("❌ No field detection model found in R2 bucket")
+            logger.error(f"❌ Available files: {[f['key'] for f in files]}")
+            return None
+        
         # Download model
         local_path = 'models/field/field-detection.onnx'
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         
-        s3.download_file(r2_bucket, 'field-detection.onnx', local_path)
+        logger.info(f"📥 Downloading {model_key} from R2...")
+        s3.download_file(r2_bucket, model_key, local_path)
         
         file_size = os.path.getsize(local_path) / (1024 * 1024)
         logger.info(f"✅ Model downloaded: {local_path} ({file_size:.2f} MB)")
@@ -179,8 +258,25 @@ def health():
         "status": "healthy",
         "service": "football-tactics-python-inference",
         "models_loaded": ["field-detection"] if field_session else [],
-        "version": "1.0.0"
+        "version": "1.0.1"
     }), 200
+
+@app.route('/debug/r2', methods=['GET'])
+def debug_r2():
+    """Debug endpoint to list R2 contents"""
+    try:
+        files = list_r2_files()
+        return jsonify({
+            "success": True,
+            "bucket": "football-tactics-models",
+            "file_count": len(files),
+            "files": files
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 @app.route('/detect/field', methods=['POST'])
 def detect_field():
@@ -255,6 +351,7 @@ def index():
         "models": ["field-detection"] if field_session else [],
         "endpoints": {
             "health": "/health",
+            "debug_r2": "/debug/r2",
             "detect_field": "/detect/field",
             "detect_players": "/detect/players (coming soon)",
             "detect_ball": "/detect/ball (coming soon)"
