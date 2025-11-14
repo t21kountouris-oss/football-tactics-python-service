@@ -6,24 +6,125 @@ import base64
 import time
 import cv2
 import os
+import logging
+
+# ============================================
+# CONFIGURE LOGGING (Gunicorn-compatible)
+# ============================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
 # ============================================
+# GLOBAL MODEL SESSION
+# ============================================
+model_session = None
+MODEL_PATH = "models/field/field-detection.onnx"
+
+# ============================================
+# R2 MODEL DOWNLOADER
+# ============================================
+def download_model_from_r2():
+    """
+    Download field-detection.onnx from Cloudflare R2
+    Returns True if successful or file already exists
+    """
+    try:
+        # Check if model already exists
+        if os.path.exists(MODEL_PATH):
+            file_size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
+            logger.info(f"✅ Model already exists: {MODEL_PATH} ({file_size_mb:.2f} MB)")
+            return True
+        
+        # Get R2 credentials from environment
+        endpoint_url = os.environ.get('R2_ENDPOINT_URL')
+        access_key = os.environ.get('R2_ACCESS_KEY_ID')
+        secret_key = os.environ.get('R2_SECRET_ACCESS_KEY')
+        bucket_name = os.environ.get('R2_BUCKET_NAME', 'football-tactics-models')
+        
+        # Check if credentials are configured
+        if not all([endpoint_url, access_key, secret_key]):
+            logger.warning("⚠️ R2 credentials not configured - cannot download model")
+            return False
+        
+        logger.info("📥 Downloading model from R2...")
+        
+        # Import boto3 (S3-compatible client for R2)
+        import boto3
+        
+        # Create S3 client
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key
+        )
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        
+        # Download file
+        r2_key = 'field/field-detection.onnx'
+        s3_client.download_file(
+            Bucket=bucket_name,
+            Key=r2_key,
+            Filename=MODEL_PATH
+        )
+        
+        file_size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
+        logger.info(f"✅ Model downloaded: {MODEL_PATH} ({file_size_mb:.2f} MB)")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to download model from R2: {e}")
+        return False
+
+# ============================================
 # LOAD MODEL ON STARTUP
 # ============================================
-print("🔄 Loading ONNX model...")
-MODEL_PATH = "field-detection.onnx"
+def load_model():
+    """Load ONNX model into memory"""
+    global model_session
+    
+    try:
+        logger.info("🔄 Loading ONNX model...")
+        
+        # First, try to download from R2 if not exists
+        download_success = download_model_from_r2()
+        
+        if not os.path.exists(MODEL_PATH):
+            logger.error(f"❌ Model file not found: {MODEL_PATH}")
+            logger.error("   - R2 download failed or model not in R2")
+            logger.error("   - Model must be uploaded to R2 bucket")
+            return False
+        
+        # Load model
+        model_session = ort.InferenceSession(MODEL_PATH)
+        
+        # Log model info
+        input_info = model_session.get_inputs()[0]
+        output_info = model_session.get_outputs()[0]
+        
+        logger.info(f"✅ Model loaded successfully: {MODEL_PATH}")
+        logger.info(f"   - Input: {input_info.name} {input_info.shape}")
+        logger.info(f"   - Output: {output_info.name} {output_info.shape}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
 
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ Model not found: {MODEL_PATH}")
-    session = None
-else:
-    session = ort.InferenceSession(MODEL_PATH)
-    print(f"✅ Model loaded: {MODEL_PATH}")
-    print(f"   - Inputs: {[inp.name for inp in session.get_inputs()]}")
-    print(f"   - Outputs: {[out.name for out in session.get_outputs()]}")
+# Load model on startup
+logger.info("🚀 Starting Flask application...")
+load_model()
 
 # ============================================
 # HEALTH CHECK ENDPOINT
@@ -31,17 +132,21 @@ else:
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    if session is None:
+    if model_session is None:
         return jsonify({
-            "status": "error",
-            "message": "Model not loaded"
+            "success": False,
+            "model_loaded": False,
+            "model_path": MODEL_PATH,
+            "file_exists": os.path.exists(MODEL_PATH),
+            "message": "Model not loaded - check logs for errors"
         }), 500
     
     return jsonify({
-        "status": "healthy",
+        "success": True,
         "model_loaded": True,
         "model_path": MODEL_PATH,
-        "models_available": ["field-detection"]
+        "models_available": ["field"],
+        "message": "Python inference service is healthy"
     }), 200
 
 # ============================================
@@ -57,10 +162,10 @@ def detect_field():
         "image": "base64-encoded-image-data"
     }
     """
-    if session is None:
+    if model_session is None:
         return jsonify({
             "success": False,
-            "error": "Model not loaded"
+            "error": "Model not loaded - service not ready"
         }), 500
     
     try:
@@ -93,7 +198,6 @@ def detect_field():
             }), 400
         
         # Preprocess image for ONNX model
-        # Resize to 640x640 (standard YOLO input size)
         original_height, original_width = image.shape[:2]
         input_size = 640
         
@@ -125,25 +229,21 @@ def detect_field():
         # Run inference
         start_time = time.time()
         
-        input_name = session.get_inputs()[0].name
-        output_name = session.get_outputs()[0].name
+        input_name = model_session.get_inputs()[0].name
+        output_name = model_session.get_outputs()[0].name
         
-        predictions = session.run([output_name], {input_name: input_tensor})[0]
+        predictions = model_session.run([output_name], {input_name: input_tensor})[0]
         
         inference_time = (time.time() - start_time) * 1000  # Convert to ms
         
+        logger.info(f"✅ Inference completed in {inference_time:.2f}ms")
+        logger.info(f"   - Input: {original_width}x{original_height}")
+        logger.info(f"   - Output shape: {predictions.shape}")
+        
         # Post-process predictions
-        # predictions shape: [1, 39, 8400] for YOLO pose
-        # 39 = 4 (bbox) + 1 (conf) + 32*2 (keypoints x,y) - but let's check actual shape
-        
-        print(f"   - Predictions shape: {predictions.shape}")
-        
-        # Extract keypoints (implementation depends on model output format)
-        # For now, return raw predictions for debugging
-        
         keypoints = []
-        # This is a simplified example - actual implementation depends on model format
-        # You'll need to parse the YOLO pose output format correctly
+        # NOTE: This is simplified - actual keypoint parsing depends on model output format
+        # You'll need to implement proper post-processing based on your YOLO pose model
         
         return jsonify({
             "success": True,
@@ -152,15 +252,15 @@ def detect_field():
                 "width": original_width,
                 "height": original_height
             },
-            "predictions_shape": predictions.shape,
-            "message": "Field detection completed (raw output - needs post-processing)",
-            "keypoints": keypoints  # Will be populated after proper post-processing
+            "predictions_shape": list(predictions.shape),
+            "keypoints": keypoints,
+            "message": "Field detection completed (post-processing needed)"
         }), 200
         
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"❌ Error in detect_field: {error_trace}")
+        logger.error(f"❌ Error in detect_field: {error_trace}")
         
         return jsonify({
             "success": False,
@@ -172,6 +272,6 @@ def detect_field():
 # START SERVER
 # ============================================
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    print(f"🚀 Starting server on port {port}...")
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"🚀 Starting server on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
