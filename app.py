@@ -1,277 +1,274 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import os
+import io
+import logging
+import base64
 import numpy as np
 import onnxruntime as ort
-import base64
-import time
-import cv2
-import os
-import logging
+from PIL import Image
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import boto3
+from botocore.client import Config
 
-# ============================================
-# CONFIGURE LOGGING (Gunicorn-compatible)
-# ============================================
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-# ============================================
-# GLOBAL MODEL SESSION
-# ============================================
-model_session = None
-MODEL_PATH = "models/field/field-detection.onnx"
+# Global model storage
+field_model = None
+field_session = None
 
-# ============================================
-# R2 MODEL DOWNLOADER
-# ============================================
 def download_model_from_r2():
-    """
-    Download field-detection.onnx from Cloudflare R2
-    Returns True if successful or file already exists
-    """
+    """Download ONNX model from Cloudflare R2"""
     try:
-        # Check if model already exists
-        if os.path.exists(MODEL_PATH):
-            file_size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
-            logger.info(f"✅ Model already exists: {MODEL_PATH} ({file_size_mb:.2f} MB)")
-            return True
-        
-        # Get R2 credentials from environment
-        endpoint_url = os.environ.get('R2_ENDPOINT_URL')
-        access_key = os.environ.get('R2_ACCESS_KEY_ID')
-        secret_key = os.environ.get('R2_SECRET_ACCESS_KEY')
-        bucket_name = os.environ.get('R2_BUCKET_NAME', 'football-tactics-models')
-        
-        # Check if credentials are configured
-        if not all([endpoint_url, access_key, secret_key]):
-            logger.warning("⚠️ R2 credentials not configured - cannot download model")
-            return False
-        
         logger.info("📥 Downloading model from R2...")
         
-        # Import boto3 (S3-compatible client for R2)
-        import boto3
+        # R2 credentials from environment
+        r2_access_key = os.environ.get('R2_ACCESS_KEY_ID')
+        r2_secret_key = os.environ.get('R2_SECRET_ACCESS_KEY')
+        r2_endpoint = os.environ.get('R2_ENDPOINT_URL')
+        r2_bucket = 'football-tactics-models'
         
-        # Create S3 client
-        s3_client = boto3.client(
+        if not all([r2_access_key, r2_secret_key, r2_endpoint]):
+            logger.error("❌ R2 credentials not configured")
+            return None
+        
+        # Create S3 client for R2
+        s3 = boto3.client(
             's3',
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key
+            endpoint_url=r2_endpoint,
+            aws_access_key_id=r2_access_key,
+            aws_secret_access_key=r2_secret_key,
+            config=Config(signature_version='s3v4'),
+            region_name='auto'
         )
         
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        # Download model
+        local_path = 'models/field/field-detection.onnx'
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
         
-        # Download file
-        r2_key = 'field/field-detection.onnx'
-        s3_client.download_file(
-            Bucket=bucket_name,
-            Key=r2_key,
-            Filename=MODEL_PATH
-        )
+        s3.download_file(r2_bucket, 'field-detection.onnx', local_path)
         
-        file_size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
-        logger.info(f"✅ Model downloaded: {MODEL_PATH} ({file_size_mb:.2f} MB)")
-        return True
+        file_size = os.path.getsize(local_path) / (1024 * 1024)
+        logger.info(f"✅ Model downloaded: {local_path} ({file_size:.2f} MB)")
         
+        return local_path
     except Exception as e:
         logger.error(f"❌ Failed to download model from R2: {e}")
-        return False
+        return None
 
-# ============================================
-# LOAD MODEL ON STARTUP
-# ============================================
-def load_model():
-    """Load ONNX model into memory"""
-    global model_session
+def load_field_model():
+    """Load field detection ONNX model"""
+    global field_session
     
     try:
         logger.info("🔄 Loading ONNX model...")
         
-        # First, try to download from R2 if not exists
-        download_success = download_model_from_r2()
+        # Download from R2
+        model_path = download_model_from_r2()
+        if not model_path:
+            raise Exception("Failed to download model")
         
-        if not os.path.exists(MODEL_PATH):
-            logger.error(f"❌ Model file not found: {MODEL_PATH}")
-            logger.error("   - R2 download failed or model not in R2")
-            logger.error("   - Model must be uploaded to R2 bucket")
-            return False
-        
-        # Load model
-        model_session = ort.InferenceSession(MODEL_PATH)
+        # Load ONNX model
+        field_session = ort.InferenceSession(
+            model_path,
+            providers=['CPUExecutionProvider']
+        )
         
         # Log model info
-        input_info = model_session.get_inputs()[0]
-        output_info = model_session.get_outputs()[0]
+        input_info = field_session.get_inputs()[0]
+        output_info = field_session.get_outputs()[0]
         
-        logger.info(f"✅ Model loaded successfully: {MODEL_PATH}")
+        logger.info(f"✅ Model loaded successfully: {model_path}")
         logger.info(f"   - Input: {input_info.name} {input_info.shape}")
         logger.info(f"   - Output: {output_info.name} {output_info.shape}")
         
         return True
-        
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return False
 
-# Load model on startup
-logger.info("🚀 Starting Flask application...")
-load_model()
+def preprocess_image(image_data, target_size=(640, 640)):
+    """Preprocess image for ONNX model"""
+    try:
+        # Decode base64
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        
+        image_bytes = base64.b64decode(image_data)
+        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        
+        # Resize
+        image = image.resize(target_size, Image.BILINEAR)
+        
+        # Convert to numpy array and normalize
+        img_array = np.array(image).astype(np.float32) / 255.0
+        
+        # Transpose to CHW format
+        img_array = img_array.transpose(2, 0, 1)
+        
+        # Add batch dimension
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        return img_array
+    except Exception as e:
+        logger.error(f"❌ Image preprocessing failed: {e}")
+        raise
 
-# ============================================
-# HEALTH CHECK ENDPOINT
-# ============================================
+def postprocess_field_detection(output, conf_threshold=0.5):
+    """Post-process field detection output to extract keypoints"""
+    try:
+        # Output shape: [1, 101, 8400]
+        # 101 = 4 (bbox) + 1 (confidence) + 96 (32 keypoints × 3: x, y, visibility)
+        
+        predictions = output[0]  # [101, 8400]
+        
+        # Get confidence scores (5th row)
+        confidences = predictions[4, :]
+        
+        # Find detections above threshold
+        mask = confidences > conf_threshold
+        
+        if not np.any(mask):
+            return {"keypoints": [], "confidence": 0.0}
+        
+        # Get highest confidence detection
+        max_idx = np.argmax(confidences)
+        confidence = float(confidences[max_idx])
+        
+        # Extract keypoints (rows 5-100 contain 32 keypoints × 3 values)
+        keypoint_data = predictions[5:101, max_idx]
+        
+        # Reshape to [32, 3] (32 keypoints, each with x, y, visibility)
+        keypoints = keypoint_data.reshape(32, 3)
+        
+        # Convert to list of dicts with normalized coordinates
+        keypoints_list = []
+        for i, (x, y, visibility) in enumerate(keypoints):
+            keypoints_list.append({
+                "id": i,
+                "x": float(x) / 640.0,  # Normalize to 0-1
+                "y": float(y) / 640.0,
+                "visibility": float(visibility)
+            })
+        
+        return {
+            "keypoints": keypoints_list,
+            "confidence": confidence,
+            "count": len(keypoints_list)
+        }
+    except Exception as e:
+        logger.error(f"❌ Postprocessing failed: {e}")
+        raise
+
+# ========================================
+# ROUTES
+# ========================================
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    if model_session is None:
-        return jsonify({
-            "success": False,
-            "model_loaded": False,
-            "model_path": MODEL_PATH,
-            "file_exists": os.path.exists(MODEL_PATH),
-            "message": "Model not loaded - check logs for errors"
-        }), 500
-    
     return jsonify({
-        "success": True,
-        "model_loaded": True,
-        "model_path": MODEL_PATH,
-        "models_available": ["field"],
-        "message": "Python inference service is healthy"
+        "status": "healthy",
+        "service": "football-tactics-python-inference",
+        "models_loaded": ["field-detection"] if field_session else [],
+        "version": "1.0.0"
     }), 200
 
-# ============================================
-# FIELD DETECTION ENDPOINT
-# ============================================
 @app.route('/detect/field', methods=['POST'])
 def detect_field():
-    """
-    Detect football field keypoints from base64-encoded image
-    
-    Request body:
-    {
-        "image": "base64-encoded-image-data"
-    }
-    """
-    if model_session is None:
-        return jsonify({
-            "success": False,
-            "error": "Model not loaded - service not ready"
-        }), 500
-    
+    """Detect football field keypoints"""
     try:
+        if not field_session:
+            return jsonify({
+                "success": False,
+                "error": "Model not loaded"
+            }), 503
+        
         # Get image from request
         data = request.get_json()
         if not data or 'image' not in data:
             return jsonify({
                 "success": False,
-                "error": "Missing 'image' field in request body"
+                "error": "Missing 'image' in request body"
             }), 400
         
-        image_base64 = data['image']
+        image_data = data['image']
+        logger.info(f"📸 Processing field detection (image size: {len(image_data) / 1024:.2f} KB)")
         
-        # Decode base64 image
-        try:
-            image_bytes = base64.b64decode(image_base64)
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if image is None:
-                return jsonify({
-                    "success": False,
-                    "error": "Failed to decode image"
-                }), 400
-                
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": f"Invalid base64 image: {str(e)}"
-            }), 400
-        
-        # Preprocess image for ONNX model
-        original_height, original_width = image.shape[:2]
-        input_size = 640
-        
-        # Resize with padding to maintain aspect ratio
-        scale = min(input_size / original_width, input_size / original_height)
-        new_width = int(original_width * scale)
-        new_height = int(original_height * scale)
-        
-        resized = cv2.resize(image, (new_width, new_height))
-        
-        # Create padded image
-        padded = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
-        
-        # Calculate padding offsets
-        pad_x = (input_size - new_width) // 2
-        pad_y = (input_size - new_height) // 2
-        
-        # Place resized image in center
-        padded[pad_y:pad_y+new_height, pad_x:pad_x+new_width] = resized
-        
-        # Convert BGR to RGB
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        
-        # Normalize to [0, 1] and transpose to CHW format
-        input_tensor = rgb.astype(np.float32) / 255.0
-        input_tensor = np.transpose(input_tensor, (2, 0, 1))  # HWC -> CHW
-        input_tensor = np.expand_dims(input_tensor, axis=0)   # Add batch dimension
+        # Preprocess image
+        input_tensor = preprocess_image(image_data)
         
         # Run inference
-        start_time = time.time()
+        input_name = field_session.get_inputs()[0].name
+        output_name = field_session.get_outputs()[0].name
         
-        input_name = model_session.get_inputs()[0].name
-        output_name = model_session.get_outputs()[0].name
+        outputs = field_session.run([output_name], {input_name: input_tensor})
         
-        predictions = model_session.run([output_name], {input_name: input_tensor})[0]
+        # Postprocess results
+        result = postprocess_field_detection(outputs[0])
         
-        inference_time = (time.time() - start_time) * 1000  # Convert to ms
-        
-        logger.info(f"✅ Inference completed in {inference_time:.2f}ms")
-        logger.info(f"   - Input: {original_width}x{original_height}")
-        logger.info(f"   - Output shape: {predictions.shape}")
-        
-        # Post-process predictions
-        keypoints = []
-        # NOTE: This is simplified - actual keypoint parsing depends on model output format
-        # You'll need to implement proper post-processing based on your YOLO pose model
+        logger.info(f"✅ Field detection complete: {result['count']} keypoints, confidence: {result['confidence']:.2f}")
         
         return jsonify({
             "success": True,
-            "inference_time": inference_time,
-            "original_size": {
-                "width": original_width,
-                "height": original_height
-            },
-            "predictions_shape": list(predictions.shape),
-            "keypoints": keypoints,
-            "message": "Field detection completed (post-processing needed)"
+            "data": result,
+            "model": "field-detection.onnx"
         }), 200
         
     except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        logger.error(f"❌ Error in detect_field: {error_trace}")
-        
+        logger.error(f"❌ Field detection failed: {e}")
         return jsonify({
             "success": False,
-            "error": str(e),
-            "trace": error_trace
+            "error": str(e)
         }), 500
 
-# ============================================
-# START SERVER
-# ============================================
+@app.route('/detect/players', methods=['POST'])
+def detect_players():
+    """Detect players (placeholder - requires players model)"""
+    return jsonify({
+        "success": False,
+        "error": "Players detection model not yet loaded"
+    }), 501
+
+@app.route('/detect/ball', methods=['POST'])
+def detect_ball():
+    """Detect ball (placeholder - requires ball model)"""
+    return jsonify({
+        "success": False,
+        "error": "Ball detection model not yet loaded"
+    }), 501
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({
+        "service": "football-tactics-python-inference",
+        "status": "running",
+        "models": ["field-detection"] if field_session else [],
+        "endpoints": {
+            "health": "/health",
+            "detect_field": "/detect/field",
+            "detect_players": "/detect/players (coming soon)",
+            "detect_ball": "/detect/ball (coming soon)"
+        }
+    }), 200
+
+# ========================================
+# STARTUP
+# ========================================
+
+# Load model on startup
+logger.info("🚀 Starting Flask application...")
+load_field_model()
+
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🚀 Starting server on port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # Development server
+    app.run(host='0.0.0.0', port=5000, debug=False)
