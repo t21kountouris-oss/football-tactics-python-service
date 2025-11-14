@@ -216,7 +216,7 @@ def postprocess_field_detection(output, conf_threshold=0.5):
         mask = confidences > conf_threshold
         
         if not np.any(mask):
-            return {"keypoints": [], "confidence": 0.0}
+            return {"keypoints": [], "confidence": 0.0, "count": 0}
         
         # Get highest confidence detection
         max_idx = np.argmax(confidences)
