@@ -152,7 +152,7 @@ def health():
 # ============================================
 # FIELD DETECTION ENDPOINT
 # ============================================
-@app.route('/detect-field', methods=['POST'])
+@app.route('/detect/field', methods=['POST'])
 def detect_field():
     """
     Detect football field keypoints from base64-encoded image
